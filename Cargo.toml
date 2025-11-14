@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ "agent-core",
     "hostd",
     "tools/wit-check",
 ]
