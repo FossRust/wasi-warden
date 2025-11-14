@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::{info, warn};
 use wasmtime::{
-    Config, Engine, Store,
     component::{Component, Linker},
+    Config, Engine, Store,
 };
+use wasmtime_wasi::add_to_linker_sync;
 
 use crate::bindings;
 use crate::bindings::exports::osagent::agent::planner::{AgentError, Observation, StepResponse};
@@ -27,6 +28,7 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
     };
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
+    add_to_linker_sync(&mut linker).context("failed to add WASI to linker")?;
     bindings::Control::add_to_linker(&mut linker, |state: &mut HostState| state)?;
 
     let mut store = Store::new(&engine, HostState::new(config));

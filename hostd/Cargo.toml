@@ -16,6 +16,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wasmtime = { version = "30.0.2", features = ["component-model", "async"] }
+wasmtime-wasi = { version = "30.0.2" }
 
 [package.metadata.component]
 # This line explicitly targets the WASI 0.2.0 command-line interface world (Preview 2)
