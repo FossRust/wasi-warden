@@ -196,6 +196,8 @@ default_profile = "default"
  
 Each browser action in planner JSON must assign an `alias` for new sessions/elements so follow-up actions (click/type/etc.) can reference them.
 
+See `docs/browser-login-task.md` for a fully worked example and `docs/status.md` for the latest progress snapshot / TODOs before resuming work.
+
 Run a test step (placeholder, subject to change):
 
 ```bash
