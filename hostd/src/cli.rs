@@ -19,7 +19,7 @@ pub enum Commands {
 #[derive(clap::Args, Debug)]
 pub struct StepArgs {
     /// Path to the compiled agent-core component (.wasm/.cwasm).
-    #[arg(long, default_value = "./target/wasm32-wasip2/release/agent-core.wasm")]
+    #[arg(long, default_value = "./target/wasm32-wasip2/release/agent_core.wasm")]
     pub component: PathBuf,
 
     /// Path to a host configuration file (TOML). Defaults to ./hostd.toml.
