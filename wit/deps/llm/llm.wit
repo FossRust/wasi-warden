@@ -1,0 +1,57 @@
+package osagent:llm;
+
+interface llm {
+  use osagent:common/types.{capability-error, json};
+
+  enum role {
+    system,
+    user,
+    assistant,
+    tool
+  }
+
+  record message {
+    role: role,
+    content: string,
+    name: option<string>
+  }
+
+  record tool-schema {
+    name: string,
+    description: string,
+    schema-json: json
+  }
+
+  record options {
+    max-tokens: option<u32>,
+    temperature: option<float32>,
+    top-p: option<float32>,
+    stop: list<string>,
+    presence-penalty: option<float32>,
+    frequency-penalty: option<float32>
+  }
+
+  record token-usage {
+    prompt-tokens: u32,
+    completion-tokens: u32,
+    total-tokens: u32
+  }
+
+  record completion-response {
+    content: string,
+    finish-reason: option<string>,
+    usage: option<token-usage>
+  }
+
+  record tool-response {
+    tool-calls-json: json,
+    finish-reason: option<string>,
+    usage: option<token-usage>
+  }
+
+  /// Generic completion without structured tool output.
+  complete: func(messages: list<message>, options: options) -> result<completion-response, capability-error>;
+
+  /// Requests modeled tool calls compatible with the host executor.
+  call-tools: func(messages: list<message>, tools: list<tool-schema>, options: options) -> result<tool-response, capability-error>;
+}

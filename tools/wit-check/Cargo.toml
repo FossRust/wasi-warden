@@ -1,0 +1,9 @@
+[package]
+name = "wit-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+wit-parser = "0.205"
+ignore = "0.4"

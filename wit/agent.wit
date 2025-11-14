@@ -1,0 +1,52 @@
+package osagent:agent;
+
+interface planner {
+  use osagent:common/types.{json};
+
+  /// Observation fed into the planner after each host action.
+  record observation {
+    step: u32,
+    summary: string,
+    data: json
+  }
+
+  /// Planned capability invocation expressed as structured JSON.
+  record planned-action {
+    capability: string,
+    input: json,
+    audit-tag: option<string>
+  }
+
+  record continue-plan {
+    thought: string,
+    actions: list<planned-action>
+  }
+
+  record complete-plan {
+    reason: string,
+    outcome: json
+  }
+
+  variant step-response {
+    continue(continue-plan),
+    complete(complete-plan)
+  }
+
+  record agent-error {
+    retryable: bool,
+    message: string
+  }
+
+  /// Stateless single planning step (plan → act → observe).
+  step: func(task: string, observation: observation) -> result<step-response, agent-error>;
+}
+
+world control {
+  import osagent:fs/fs;
+  import osagent:proc/proc;
+  import osagent:browser/browser;
+  import osagent:input/input;
+  import osagent:llm/llm;
+  import osagent:policy/policy;
+  export planner;
+}

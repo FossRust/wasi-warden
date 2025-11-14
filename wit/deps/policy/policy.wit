@@ -1,0 +1,68 @@
+package osagent:policy;
+
+interface policy {
+  use osagent:common/types.{audit-event, capability-error};
+
+  enum budget-kind {
+    steps,
+    wallclock-ms,
+    llm-tokens,
+    processes,
+    filesystem-ops,
+    browser-actions
+  }
+
+  record budget-snapshot {
+    kind: budget-kind,
+    limit: option<u64>,
+    used: u64
+  }
+
+  record workspace-rule {
+    label: string,
+    relative-root: string,
+    read-only: bool,
+    max-file-bytes: option<u64>
+  }
+
+  record command-rule {
+    name: string,
+    description: option<string>
+  }
+
+  record browser-rule {
+    allowed-hosts: list<string>,
+    allow-screenshots: bool,
+    allow-file-uploads: bool
+  }
+
+  record policy-snapshot {
+    workspaces: list<workspace-rule>,
+    commands: list<command-rule>,
+    browser: option<browser-rule>,
+    budgets: list<budget-snapshot>
+  }
+
+  record grant-request {
+    capability: string,
+    scope: option<string>,
+    justification: string
+  }
+
+  record grant-response {
+    approved: bool,
+    reason: option<string>
+  }
+
+  /// Returns the current policy snapshot so the agent can plan safely.
+  describe: func() -> result<policy-snapshot, capability-error>;
+
+  /// Attempts to spend a portion of the configured budget.
+  claim-budget: func(kind: budget-kind, units: u64) -> result<budget-snapshot, capability-error>;
+
+  /// Requests a new capability or scope; host may require human approval.
+  request-capability: func(request: grant-request) -> result<grant-response, capability-error>;
+
+  /// Emits a structured audit record for host-side storage.
+  log-event: func(event: audit-event) -> result<_, capability-error>;
+}

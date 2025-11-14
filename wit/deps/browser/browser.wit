@@ -1,0 +1,75 @@
+package osagent:browser;
+
+interface browser {
+  use osagent:common/types.{bytes, capability-error, json, milliseconds};
+
+  /// Browser automation session (e.g., WebDriver / CDP target).
+  resource session {
+    close: func();
+
+    /// Navigates to the URL and waits for document.readyState="complete".
+    goto: func(url: string, timeout-ms: option<milliseconds>) -> result<page-state, capability-error>;
+
+    /// Returns the current page state without mutating.
+    describe-page: func(include-html: bool) -> result<page-state, capability-error>;
+
+    /// Captures a screenshot in the configured mime-type.
+    screenshot: func(kind: screenshot-kind) -> result<screenshot, capability-error>;
+
+    /// Evaluates a sandboxed script (e.g., DOM query).
+    eval: func(expression: string) -> result<json, capability-error>;
+
+    /// Finds the first matching element.
+    find: func(selector: selector, timeout-ms: option<milliseconds>) -> result<own<element-handle>, capability-error>;
+
+    /// Finds all currently matching elements.
+    query-all: func(selector: selector) -> result<list<own<element-handle>>, capability-error>;
+  }
+
+  /// Handle to an element scoped to the owning session.
+  resource element-handle {
+    click: func() -> result<_, capability-error>;
+    type-text: func(text: string, submit: bool) -> result<_, capability-error>;
+    clear: func() -> result<_, capability-error>;
+    attribute: func(name: string) -> result<option<string>, capability-error>;
+    inner-text: func() -> result<string, capability-error>;
+    html: func() -> result<string, capability-error>;
+  }
+
+  enum selector-kind {
+    css,
+    xpath,
+    text
+  }
+
+  record selector {
+    kind: selector-kind,
+    value: string
+  }
+
+  enum screenshot-kind {
+    png,
+    jpeg
+  }
+
+  record screenshot {
+    mime-type: string,
+    data: bytes
+  }
+
+  record page-state {
+    url: string,
+    title: option<string>,
+    html: option<string>
+  }
+
+  record session-options {
+    /// Policy-defined profile label (e.g., "default", "isolated").
+    profile: option<string>,
+    headless: bool,
+    allow-downloads: bool
+  }
+
+  /// Opens a new controlled browser session.
+  open-session: func(options: session-options) -> result<own<session>, capability-error>;
+}

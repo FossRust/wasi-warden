@@ -1,0 +1,38 @@
+package osagent:common;
+
+interface types {
+  /// JSON is transported as UTF-8 text; callers own schema validation.
+  type json = string;
+
+  /// Convenience alias for opaque binary payloads.
+  type bytes = list<u8>;
+
+  /// Millisecond-resolution timestamps or durations.
+  type milliseconds = u64;
+
+  /// Canonical error codes shared by every capability.
+  enum capability-error-code {
+    denied,
+    not-found,
+    invalid-argument,
+    limit,
+    timeout,
+    conflict,
+    unavailable,
+    internal
+  }
+
+  /// Structured error propagated across the host/guest boundary.
+  record capability-error {
+    code: capability-error-code,
+    message: string,
+    detail: option<json>
+  }
+
+  /// Standard audit payload emitted by capabilities and the agent.
+  record audit-event {
+    event-type: string,
+    step: option<u32>,
+    payload: json
+  }
+}

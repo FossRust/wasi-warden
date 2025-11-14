@@ -1,0 +1,69 @@
+package osagent:proc;
+
+interface proc {
+  use osagent:common/types.{capability-error, milliseconds};
+
+  /// Host-controlled child process handle.
+  resource process {
+    /// Sends bytes to stdin; setting eof closes the stream.
+    write-stdin: func(chunk: list<u8>, eof: bool) -> result<u32, capability-error>;
+
+    /// Reads from stdout up to max-bytes.
+    read-stdout: func(max-bytes: u32) -> result<stream-read, capability-error>;
+
+    /// Reads from stderr up to max-bytes.
+    read-stderr: func(max-bytes: u32) -> result<stream-read, capability-error>;
+
+    /// Waits for completion or timeout.
+    wait: func(timeout-ms: option<milliseconds>) -> result<exit-status, capability-error>;
+
+    /// Sends a signal to the running process.
+    signal: func(kind: process-signal) -> result<_, capability-error>;
+
+    /// Drops the process handle without killing.
+    close: func();
+  }
+
+  /// Spawn configuration for a process.
+  record spawn-options {
+    argv: list<string>,
+    working-dir: option<string>,
+    env: list<env-var>,
+    stdin: stdio-mode,
+    stdout: stdio-mode,
+    stderr: stdio-mode,
+    timeout-ms: option<milliseconds>
+  }
+
+  record env-var {
+    key: string,
+    value: string
+  }
+
+  enum stdio-mode {
+    inherit,
+    null,
+    pipe
+  }
+
+  enum process-signal {
+    term,
+    kill,
+    interrupt,
+    hangup
+  }
+
+  record stream-read {
+    data: list<u8>,
+    eof: bool
+  }
+
+  record exit-status {
+    code: option<s32>,
+    signal: option<process-signal>,
+    timed-out: bool
+  }
+
+  /// Launches a command from the allowlist enforced by policy.
+  spawn: func(command: string, options: spawn-options) -> result<own<process>, capability-error>;
+}

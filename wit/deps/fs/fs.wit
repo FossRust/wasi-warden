@@ -1,0 +1,79 @@
+package osagent:fs;
+
+interface fs {
+  use osagent:common/types.{capability-error};
+
+  /// Opaque handle to a whitelisted workspace directory.
+  resource dir-handle {
+    close: func();
+  }
+
+  /// Host-managed file handle scoped to a previously granted directory.
+  resource file-handle {
+    read: func(max-bytes: u64) -> result<list<u8>, capability-error>;
+    read-to-string: func(max-bytes: u64) -> result<string, capability-error>;
+    write: func(bytes: list<u8>) -> result<u64, capability-error>;
+    write-string: func(contents: string, newline: bool) -> result<u64, capability-error>;
+    set-len: func(new-len: u64) -> result<_, capability-error>;
+    flush: func() -> result<_, capability-error>;
+    close: func();
+  }
+
+  /// Directory and file listing metadata.
+  enum entry-kind {
+    file,
+    directory,
+    symlink,
+    other
+  }
+
+  record dir-entry {
+    name: string,
+    kind: entry-kind,
+    size-bytes: option<u64>,
+    modified-ms: option<u64>
+  }
+
+  record entry-metadata {
+    name: string,
+    kind: entry-kind,
+    size-bytes: option<u64>,
+    modified-ms: option<u64>,
+    readonly: bool
+  }
+
+  record file-open-options {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    truncate: bool
+  }
+
+  /// Returns the root workspace directory configured by policy.
+  open-workspace: func() -> result<own<dir-handle>, capability-error>;
+
+  /// Opens a child directory relative to an allowed parent handle.
+  open-dir: func(parent: borrow<dir-handle>, relative-path: string) -> result<own<dir-handle>, capability-error>;
+
+  /// Creates the directory path if missing and returns a handle.
+  ensure-dir: func(parent: borrow<dir-handle>, relative-path: string) -> result<own<dir-handle>, capability-error>;
+
+  /// Removes a directory within the scoped parent.
+  remove-dir: func(parent: borrow<dir-handle>, relative-path: string, recursive: bool) -> result<_, capability-error>;
+
+  /// Removes a file relative to the scoped parent.
+  remove-file: func(parent: borrow<dir-handle>, relative-path: string) -> result<_, capability-error>;
+
+  /// Renames a file or directory within the same parent.
+  rename: func(parent: borrow<dir-handle>, old-path: string, new-path: string) -> result<_, capability-error>;
+
+  /// Lists entries for the provided directory handle.
+  list-dir: func(target: borrow<dir-handle>) -> result<list<dir-entry>, capability-error>;
+
+  /// Returns metadata for a path relative to the parent or for the parent itself.
+  metadata: func(parent: borrow<dir-handle>, relative-path: option<string>) -> result<entry-metadata, capability-error>;
+
+  /// Opens a file relative to a scoped parent directory.
+  open-file: func(parent: borrow<dir-handle>, relative-path: string, options: file-open-options) -> result<own<file-handle>, capability-error>;
+}

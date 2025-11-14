@@ -1,0 +1,50 @@
+package osagent:input;
+
+interface input {
+  use osagent:common/types.{capability-error, milliseconds};
+
+  enum key-modifier {
+    shift,
+    ctrl,
+    alt,
+    meta
+  }
+
+  record key-chord {
+    key: string,
+    modifiers: list<key-modifier>,
+    hold-ms: option<milliseconds>
+  }
+
+  enum mouse-button {
+    left,
+    right,
+    middle
+  }
+
+  record pointer-move {
+    x: s32,
+    y: s32,
+    relative: bool
+  }
+
+  record scroll-delta {
+    horizontal: s32,
+    vertical: s32
+  }
+
+  /// Types a sequence of Unicode characters using the active layout.
+  key-sequence: func(text: string) -> result<_, capability-error>;
+
+  /// Sends an explicit chord (e.g., CTRL+S).
+  send-key-chord: func(chord: key-chord) -> result<_, capability-error>;
+
+  /// Moves the pointer either absolutely or relative to the current position.
+  mouse-move: func(motion: pointer-move) -> result<_, capability-error>;
+
+  /// Clicks the given mouse button with optional press duration.
+  mouse-click: func(button: mouse-button, hold-ms: option<milliseconds>) -> result<_, capability-error>;
+
+  /// Scrolls the pointer by the provided delta.
+  mouse-scroll: func(delta: scroll-delta) -> result<_, capability-error>;
+}
