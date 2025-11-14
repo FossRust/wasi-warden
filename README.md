@@ -12,6 +12,13 @@ Think: **computer-use / RPA / ops runbooks**, but:
 * policy-driven
 * LLM-agnostic
 
+For instance, let's say you want to loginto a website using browser automation:
+
+```
+cargo run -p hostd -- step \
+  --task "Log into https://demo.example/login with creds in secrets/demo-login.json and confirm the dashboard greets the user."
+```
+
 ---
 
 ## Why this exists
