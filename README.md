@@ -19,6 +19,8 @@ cargo run -p hostd -- step \
   --task "Log into https://demo.example/login with creds in secrets/demo-login.json and confirm the dashboard greets the user."
 ```
 
+More about running this sample task here: https://github.com/FossRust/wasi-warden/blob/main/docs/browser-login-task.md
+
 ---
 
 ## Why this exists
