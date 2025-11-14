@@ -13,6 +13,7 @@ pub struct HostConfig {
     pub workspace_root: Utf8PathBuf,
     pub allowed_proc_commands: Vec<String>,
     pub llm: Option<LlmSettings>,
+    pub browser: Option<BrowserSettings>,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,12 @@ pub struct LlmSettings {
     pub api_base: String,
     pub api_key: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserSettings {
+    pub webdriver_url: String,
+    pub default_profile: Option<String>,
 }
 
 impl HostConfig {
@@ -40,15 +47,19 @@ impl HostConfig {
         allowed_proc_commands.extend(args.allow_proc.iter().cloned());
         allowed_proc_commands.sort();
         allowed_proc_commands.dedup();
-        let llm = if let Some(cfg) = file_cfg.llm {
-            cfg.into_settings()?
-        } else {
-            None
+        let llm = match file_cfg.llm {
+            Some(cfg) => cfg.into_settings()?,
+            None => None,
+        };
+        let browser = match file_cfg.browser {
+            Some(cfg) => cfg.into_settings()?,
+            None => None,
         };
         Ok(Self {
             workspace_root,
             allowed_proc_commands,
             llm,
+            browser,
         })
     }
 
@@ -71,6 +82,7 @@ struct FileConfig {
     workspace_root: Option<String>,
     allow_proc: Option<Vec<String>>,
     llm: Option<LlmFileSettings>,
+    browser: Option<BrowserFileSettings>,
 }
 
 impl FileConfig {
@@ -125,4 +137,23 @@ fn normalize_path(path: &Path) -> Result<Utf8PathBuf> {
     };
     let canonical = fs::canonicalize(&absolute).unwrap_or(absolute);
     Utf8PathBuf::from_path_buf(canonical).map_err(|_| anyhow::anyhow!("path is not valid UTF-8"))
+}
+
+#[derive(Deserialize)]
+struct BrowserFileSettings {
+    webdriver_url: Option<String>,
+    default_profile: Option<String>,
+}
+
+impl BrowserFileSettings {
+    fn into_settings(self) -> Result<Option<BrowserSettings>> {
+        let url = match self.webdriver_url {
+            Some(url) if !url.trim().is_empty() => url,
+            _ => return Ok(None),
+        };
+        Ok(Some(BrowserSettings {
+            webdriver_url: url,
+            default_profile: self.default_profile.filter(|p| !p.trim().is_empty()),
+        }))
+    }
 }

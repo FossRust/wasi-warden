@@ -9,7 +9,9 @@ use wasmtime::{
 };
 use wasmtime_wasi::add_to_linker_sync;
 
-use crate::actions::{ActionReport, execute_planned_actions};
+use tokio::runtime::Handle;
+
+use crate::actions::{ActionExecutor, ActionReport};
 use crate::bindings;
 use crate::bindings::exports::osagent::agent::planner::{AgentError, Observation, StepResponse};
 use crate::cli::StepArgs;
@@ -35,6 +37,9 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
     add_to_linker_sync(&mut linker).context("failed to add WASI to linker")?;
     bindings::Control::add_to_linker(&mut linker, |state: &mut HostState| state)?;
 
+    let tokio_handle = Handle::current();
+    let mut executor = ActionExecutor::new(config.clone(), tokio_handle.clone());
+
     let mut store = Store::new(&engine, HostState::new(config.clone()));
     let control = bindings::Control::instantiate(&mut store, &component, &linker)
         .context("failed to instantiate component")?;
@@ -54,7 +59,7 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
                     actions = plan.actions.len(),
                     "planner requested capability executions"
                 );
-                let reports = execute_planned_actions(&config, &plan.actions);
+                let reports = executor.execute(&plan.actions);
                 log_action_reports(&reports);
                 current_step = current_step.saturating_add(1);
                 observation = Observation {

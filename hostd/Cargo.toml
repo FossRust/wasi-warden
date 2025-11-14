@@ -19,6 +19,7 @@ wasmtime = { version = "30.0.2", features = ["component-model", "async"] }
 wasmtime-wasi = { version = "30.0.2" }
 ureq = { version = "2.10.0", default-features = false, features = ["tls", "json"] }
 base64 = "0.22"
+thirtyfour = { version = "0.34", default-features = false, features = ["rustls-tls"] }
 
 [package.metadata.component]
 # This line explicitly targets the WASI 0.2.0 command-line interface world (Preview 2)

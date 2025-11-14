@@ -186,6 +186,16 @@ cp ../hostd-sample.toml ../hostd.toml
 # edit hostd.toml
 ```
 
+To enable browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.):
+
+```toml
+[browser]
+webdriver_url = "http://127.0.0.1:9515"
+default_profile = "default"
+```
+ 
+Each browser action in planner JSON must assign an `alias` for new sessions/elements so follow-up actions (click/type/etc.) can reference them.
+
 Run a test step (placeholder, subject to change):
 
 ```bash
@@ -240,6 +250,7 @@ Short-term:
 * Basic fs + proc + llm loop.
 * Simple JSON action format for LLMs.
 * Example: “clone repo, run tests, fix lint, summarize” workflow.
+* Browser login sample task using `browser.*` selectors (see `docs/browser-login-task.md`).
 
 Medium-term:
 
