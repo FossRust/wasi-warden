@@ -1,4 +1,5 @@
-use serde::Serialize;
+use serde::Deserialize;
+use serde_json::Value;
 
 mod bindings {
     wit_bindgen::generate!({
@@ -9,131 +10,120 @@ mod bindings {
     });
 }
 
-use bindings::exports::osagent::agent::planner::{self, AgentError, CompletePlan, StepResponse};
+use bindings::exports::osagent::agent::planner::{
+    self, AgentError, CompletePlan, ContinuePlan, PlannedAction, StepResponse,
+};
 use bindings::osagent::common::types::{CapabilityError, CapabilityErrorCode};
-use bindings::osagent::fs::fs;
-use bindings::osagent::proc::proc;
+use bindings::osagent::llm::llm::{self, Message, Role};
+
+const SYSTEM_PROMPT: &str = r#"
+You are an expert automation planner operating inside a secure agent runtime.
+Respond ONLY with JSON matching this schema:
+{
+  "status": "continue" | "complete",
+  "thought": "human-readable reasoning",
+  "actions": [
+     { "capability": "fs.list_dir" | "proc.spawn" | "fs.read_file",
+       "input": { ... json arguments ... }
+     }
+  ],
+  "result": { ... final result json when status == "complete" },
+  "reason": "short explanation when status == \"complete\""
+}
+When status is \"continue\" you MUST include at least one action describing the next capability call.
+Capabilities available:
+- fs.list_dir { "path": "<relative path>" }
+- fs.read_file { "path": "<relative path>", "max_bytes": 4096 }
+- proc.spawn { "command": "<program>", "args": ["..."] }
+Always keep paths relative to the provided workspace.
+"#;
 
 struct Agent;
 
 impl planner::Guest for Agent {
-    fn step(task: String, _observation: planner::Observation) -> Result<StepResponse, AgentError> {
-        if let Some(path) = task.strip_prefix("list ") {
-            let summary = format!("listed path `{}`", path.trim());
-            let output = list_path(path.trim()).map_err(agent_error)?;
-            Ok(StepResponse::Complete(CompletePlan {
-                reason: summary,
-                outcome: output,
-            }))
-        } else if let Some(rest) = task.strip_prefix("run ") {
-            let summary = format!("ran command `{}`", rest.trim());
-            let output = run_command(rest.trim()).map_err(agent_error)?;
-            Ok(StepResponse::Complete(CompletePlan {
-                reason: summary,
-                outcome: output,
-            }))
-        } else {
-            Ok(StepResponse::Complete(CompletePlan {
-                reason: "task not understood".to_string(),
-                outcome: "{}".to_string(),
-            }))
-        }
+    fn step(task: String, observation: planner::Observation) -> Result<StepResponse, AgentError> {
+        plan_with_llm(task, observation).map_err(agent_error)
     }
 }
 
 bindings::export!(Agent);
 
-fn list_path(path: &str) -> Result<String, AgentErr> {
-    let root = fs::open_workspace().map_err(cap_err("fs.open_workspace"))?;
-    let target = if path.is_empty() || path == "." {
-        root
-    } else {
-        fs::open_dir(&root, path).map_err(cap_err("fs.open_dir"))?
+fn plan_with_llm(
+    task: String,
+    observation: planner::Observation,
+) -> Result<StepResponse, AgentErr> {
+    let messages = build_messages(&task, &observation);
+    let options = llm::Options {
+        max_tokens: Some(600),
+        temperature: Some(0.2),
+        top_p: Some(0.9),
+        stop: Vec::new(),
+        presence_penalty: None,
+        frequency_penalty: None,
     };
-    let entries = fs::list_dir(&target).map_err(cap_err("fs.list_dir"))?;
-    #[derive(Serialize)]
-    struct Entry {
-        name: String,
-        kind: String,
-        size_bytes: Option<u64>,
-    }
-    let data: Vec<Entry> = entries
-        .into_iter()
-        .map(|entry| Entry {
-            name: entry.name,
-            kind: format!("{:?}", entry.kind),
-            size_bytes: entry.size_bytes,
-        })
-        .collect();
-    to_json(&data)
-}
+    let completion = llm::complete(&messages, &options).map_err(cap_err("llm.complete"))?;
+    let envelope: PlanEnvelope = serde_json::from_str(&completion.content).map_err(|err| {
+        AgentErr::fatal(format!(
+            "failed to parse LLM response: {err}; content: {}",
+            completion.content
+        ))
+    })?;
 
-fn run_command(spec: &str) -> Result<String, AgentErr> {
-    let mut parts = spec
-        .split_whitespace()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return Err(AgentErr::fatal("no program specified"));
-    }
-    let program = parts.remove(0);
-    let options = proc::SpawnOptions {
-        argv: parts.clone(),
-        working_dir: None,
-        env: Vec::new(),
-        stdin: proc::StdioMode::Null,
-        stdout: proc::StdioMode::Pipe,
-        stderr: proc::StdioMode::Pipe,
-        timeout_ms: None,
-    };
-    let process = proc::spawn(&program, &options).map_err(cap_err("proc.spawn"))?;
-    let stdout = read_stream(&process, |p| p.read_stdout(4096))?;
-    let stderr = read_stream(&process, |p| p.read_stderr(4096))?;
-    let status = process.wait(None).map_err(cap_err("proc.wait"))?;
-    process.close();
-
-    #[derive(Serialize)]
-    struct RunResult {
-        program: String,
-        argv: Vec<String>,
-        exit_code: Option<i32>,
-        stdout: String,
-        stderr: String,
-    }
-
-    let result = RunResult {
-        program,
-        argv: parts,
-        exit_code: status.code,
-        stdout: bytes_to_text(stdout),
-        stderr: bytes_to_text(stderr),
-    };
-    to_json(&result)
-}
-
-fn read_stream<F>(process: &proc::Process, mut reader: F) -> Result<Vec<u8>, AgentErr>
-where
-    F: FnMut(&proc::Process) -> Result<proc::StreamRead, CapabilityError>,
-{
-    let mut data = Vec::new();
-    loop {
-        let chunk = reader(process).map_err(cap_err("proc.read"))?;
-        data.extend_from_slice(&chunk.data);
-        if chunk.eof {
-            break;
+    match envelope.status {
+        PlanStatus::Continue => {
+            let actions = envelope
+                .actions
+                .ok_or_else(|| AgentErr::fatal("LLM continuation missing actions"))?;
+            if actions.is_empty() {
+                return Err(AgentErr::fatal("LLM returned no actions"));
+            }
+            let planned = actions
+                .into_iter()
+                .map(to_planned_action)
+                .collect::<Result<_, _>>()?;
+            let thought = envelope
+                .thought
+                .unwrap_or_else(|| "No reasoning provided.".to_string());
+            Ok(StepResponse::Continue(ContinuePlan {
+                thought,
+                actions: planned,
+            }))
+        }
+        PlanStatus::Complete => {
+            let reason = envelope
+                .reason
+                .or(envelope.thought)
+                .unwrap_or_else(|| "task complete".to_string());
+            let outcome = envelope.result.unwrap_or(Value::Null).to_string();
+            Ok(StepResponse::Complete(CompletePlan { reason, outcome }))
         }
     }
-    Ok(data)
 }
 
-fn bytes_to_text(data: Vec<u8>) -> String {
-    String::from_utf8_lossy(&data).to_string()
+fn build_messages(task: &str, observation: &planner::Observation) -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::System,
+            content: SYSTEM_PROMPT.to_string(),
+            name: None,
+        },
+        Message {
+            role: Role::User,
+            content: format!(
+                "Task: {task}\nCurrent step #: {}\nLast observation summary: {}\nObservation data: {}",
+                observation.step, observation.summary, observation.data
+            ),
+            name: None,
+        },
+    ]
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<String, AgentErr> {
-    serde_json::to_string(value).map_err(|err| AgentErr::fatal(format!("json error: {err}")))
+fn to_planned_action(action: LlmAction) -> Result<PlannedAction, AgentErr> {
+    Ok(PlannedAction {
+        capability: action.capability,
+        input: action.input.to_string(),
+        audit_tag: None,
+    })
 }
 
 fn cap_err(op: &'static str) -> impl Fn(CapabilityError) -> AgentErr {
@@ -169,4 +159,26 @@ impl AgentErr {
     fn fatal(message: impl Into<String>) -> Self {
         Self::new(false, message)
     }
+}
+
+#[derive(Deserialize)]
+struct PlanEnvelope {
+    status: PlanStatus,
+    thought: Option<String>,
+    actions: Option<Vec<LlmAction>>,
+    result: Option<Value>,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PlanStatus {
+    Continue,
+    Complete,
+}
+
+#[derive(Deserialize)]
+struct LlmAction {
+    capability: String,
+    input: Value,
 }

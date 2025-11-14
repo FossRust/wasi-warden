@@ -2,15 +2,20 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
-use crate::config::HostConfig;
+use crate::config::{HostConfig, LlmSettings};
 use crate::resources::{DirHandleResource, FileHandleResource, ProcessResource};
 use crate::state::HostState;
+use bindings::osagent::llm::llm::Role as MessageRole;
 
 type CapabilityError = bindings::osagent::common::types::CapabilityError;
 type CapabilityErrorCode = bindings::osagent::common::types::CapabilityErrorCode;
@@ -39,6 +44,236 @@ fn table_error(err: ResourceTableError) -> CapabilityError {
             capability_error(CapabilityErrorCode::Conflict, "resource has live children")
         }
     }
+}
+
+fn require_llm_settings<'a>(config: &'a HostConfig) -> Result<&'a LlmSettings, CapabilityError> {
+    config.llm.as_ref().ok_or_else(|| {
+        capability_error(
+            CapabilityErrorCode::Unavailable,
+            "llm capability is not configured",
+        )
+    })
+}
+
+fn http_client() -> Result<Client, CapabilityError> {
+    Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|err| {
+            capability_error(
+                CapabilityErrorCode::Unavailable,
+                format!("http error: {err}"),
+            )
+        })
+}
+
+fn chat_endpoint(base: &str) -> String {
+    format!("{}/chat/completions", base.trim_end_matches('/'))
+}
+
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChatTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatToolFunction,
+}
+
+#[derive(Serialize)]
+struct ChatToolFunction {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    parameters: Value,
+}
+
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatChoiceMessage,
+    #[serde(rename = "finish_reason")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoiceMessage {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ToolCall {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    id: Option<String>,
+    function: FunctionCall,
+}
+
+#[derive(Deserialize, Serialize)]
+struct FunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Deserialize)]
+struct ChatUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+}
+
+fn convert_usage(usage: Option<ChatUsage>) -> Option<bindings::osagent::llm::llm::TokenUsage> {
+    usage.map(|u| bindings::osagent::llm::llm::TokenUsage {
+        prompt_tokens: u.prompt_tokens.unwrap_or_default(),
+        completion_tokens: u.completion_tokens.unwrap_or_default(),
+        total_tokens: u.total_tokens.unwrap_or_default(),
+    })
+}
+
+fn messages_to_chat(
+    messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .map(|msg| ChatMessage {
+            role: match msg.role {
+                MessageRole::System => "system".to_string(),
+                MessageRole::User => "user".to_string(),
+                MessageRole::Assistant => "assistant".to_string(),
+                MessageRole::Tool => "tool".to_string(),
+            },
+            content: msg.content,
+            name: msg.name.filter(|n| !n.trim().is_empty()),
+        })
+        .collect()
+}
+
+fn tools_to_chat(
+    tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
+) -> Result<Vec<ChatTool>, CapabilityError> {
+    let mut result = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let parameters: Value = serde_json::from_str(&tool.schema_json).map_err(|_| {
+            capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                format!("invalid tool schema for {}", tool.name),
+            )
+        })?;
+        result.push(ChatTool {
+            kind: "function",
+            function: ChatToolFunction {
+                name: tool.name,
+                description: Some(tool.description),
+                parameters,
+            },
+        });
+    }
+    Ok(result)
+}
+
+fn build_chat_request(
+    model: &str,
+    messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+    options: bindings::osagent::llm::llm::Options,
+    tools: Option<Vec<ChatTool>>,
+) -> ChatRequest {
+    let stop = if options.stop.is_empty() {
+        None
+    } else {
+        Some(options.stop)
+    };
+    ChatRequest {
+        model: model.to_string(),
+        messages: messages_to_chat(messages),
+        tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+        tools,
+        max_tokens: options.max_tokens,
+        temperature: options.temperature,
+        top_p: options.top_p,
+        stop,
+        presence_penalty: options.presence_penalty,
+        frequency_penalty: options.frequency_penalty,
+    }
+}
+
+fn execute_chat_request(
+    settings: &LlmSettings,
+    body: &ChatRequest,
+) -> Result<ChatResponse, CapabilityError> {
+    let client = http_client()?;
+    let url = chat_endpoint(&settings.api_base);
+    let token = format!("Bearer {}", settings.api_key);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&token).map_err(|err| {
+            capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                format!("invalid api key: {err}"),
+            )
+        })?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let response = client
+        .post(url)
+        .headers(headers)
+        .json(body)
+        .send()
+        .map_err(|err| {
+            capability_error(
+                CapabilityErrorCode::Unavailable,
+                format!("llm request failed: {err}"),
+            )
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        return Err(capability_error(
+            CapabilityErrorCode::Unavailable,
+            format!("llm error {status}: {text}"),
+        ));
+    }
+    response.json().map_err(|err| {
+        capability_error(
+            CapabilityErrorCode::Internal,
+            format!("failed to parse llm response: {err}"),
+        )
+    })
 }
 
 fn io_error(op: &str, err: std::io::Error) -> CapabilityError {
@@ -877,25 +1112,68 @@ impl bindings::osagent::input::input::Host for HostState {
 impl bindings::osagent::llm::llm::Host for HostState {
     fn complete(
         &mut self,
-        _messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
-        _options: bindings::osagent::llm::llm::Options,
+        messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+        options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "llm capability is not implemented",
-        ))
+        let settings = require_llm_settings(&self.config)?;
+        let request = build_chat_request(&settings.model, messages, options, None);
+        let response = execute_chat_request(settings, &request)?;
+        let usage = convert_usage(response.usage);
+        let mut choices = response.choices.into_iter();
+        let choice = choices.next().ok_or_else(|| {
+            capability_error(
+                CapabilityErrorCode::Internal,
+                "llm response missing choices",
+            )
+        })?;
+        let content = choice.message.content.ok_or_else(|| {
+            capability_error(
+                CapabilityErrorCode::Internal,
+                "llm response missing content",
+            )
+        })?;
+        Ok(bindings::osagent::llm::llm::CompletionResponse {
+            content,
+            finish_reason: choice.finish_reason,
+            usage,
+        })
     }
 
     fn call_tools(
         &mut self,
-        _messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
-        _tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
-        _options: bindings::osagent::llm::llm::Options,
+        messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+        tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
+        options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "llm capability is not implemented",
-        ))
+        let settings = require_llm_settings(&self.config)?;
+        let chat_tools = tools_to_chat(tools)?;
+        let request = build_chat_request(&settings.model, messages, options, Some(chat_tools));
+        let response = execute_chat_request(settings, &request)?;
+        let usage = convert_usage(response.usage);
+        let mut choices = response.choices.into_iter();
+        let choice = choices.next().ok_or_else(|| {
+            capability_error(
+                CapabilityErrorCode::Internal,
+                "llm response missing choices",
+            )
+        })?;
+        if choice.message.tool_calls.is_empty() {
+            return Err(capability_error(
+                CapabilityErrorCode::Internal,
+                "llm response missing tool calls",
+            ));
+        }
+        let tool_calls_json = serde_json::to_string(&choice.message.tool_calls).map_err(|err| {
+            capability_error(
+                CapabilityErrorCode::Internal,
+                format!("failed to encode tool calls: {err}"),
+            )
+        })?;
+        Ok(bindings::osagent::llm::llm::ToolResponse {
+            tool_calls_json,
+            finish_reason: choice.finish_reason,
+            usage,
+        })
     }
 }
 

@@ -12,6 +12,14 @@ use crate::cli::StepArgs;
 pub struct HostConfig {
     pub workspace_root: Utf8PathBuf,
     pub allowed_proc_commands: Vec<String>,
+    pub llm: Option<LlmSettings>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmSettings {
+    pub api_base: String,
+    pub api_key: String,
+    pub model: String,
 }
 
 impl HostConfig {
@@ -32,9 +40,15 @@ impl HostConfig {
         allowed_proc_commands.extend(args.allow_proc.iter().cloned());
         allowed_proc_commands.sort();
         allowed_proc_commands.dedup();
+        let llm = if let Some(cfg) = file_cfg.llm {
+            cfg.into_settings()?
+        } else {
+            None
+        };
         Ok(Self {
             workspace_root,
             allowed_proc_commands,
+            llm,
         })
     }
 
@@ -56,6 +70,7 @@ impl HostConfig {
 struct FileConfig {
     workspace_root: Option<String>,
     allow_proc: Option<Vec<String>>,
+    llm: Option<LlmFileSettings>,
 }
 
 impl FileConfig {
@@ -68,6 +83,35 @@ impl FileConfig {
         } else {
             Ok(Self::default())
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct LlmFileSettings {
+    api_base: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+}
+
+impl LlmFileSettings {
+    fn into_settings(self) -> Result<Option<LlmSettings>> {
+        let api_key = match self.api_key {
+            Some(key) if !key.trim().is_empty() => key,
+            _ => return Ok(None),
+        };
+        let model = match self.model {
+            Some(model) if !model.trim().is_empty() => model,
+            _ => return Ok(None),
+        };
+        let api_base = self
+            .api_base
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        Ok(Some(LlmSettings {
+            api_base,
+            api_key,
+            model,
+        }))
     }
 }
 
