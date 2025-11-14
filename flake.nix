@@ -33,6 +33,7 @@
               pkgs.pkg-config
               pkgs.openssl
               pkgs.protobuf
+              pkgs.ollama
             ]; 
             
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library"; 
