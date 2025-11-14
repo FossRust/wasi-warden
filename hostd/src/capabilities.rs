@@ -1,19 +1,22 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
-use crate::resources::{DirHandleResource, FileHandleResource};
+use crate::config::HostConfig;
+use crate::resources::{DirHandleResource, FileHandleResource, ProcessResource};
 use crate::state::HostState;
 
 type CapabilityError = bindings::osagent::common::types::CapabilityError;
 type CapabilityErrorCode = bindings::osagent::common::types::CapabilityErrorCode;
 type DirHandle = bindings::osagent::fs::fs::DirHandle;
 type FileHandle = bindings::osagent::fs::fs::FileHandle;
+type ProcHandle = bindings::osagent::proc::proc::Process;
 
 fn capability_error(code: CapabilityErrorCode, message: impl Into<String>) -> CapabilityError {
     CapabilityError {
@@ -132,6 +135,21 @@ fn delete_file(state: &mut HostState, handle: Resource<FileHandle>) -> Result<()
     Ok(())
 }
 
+fn process_entry_mut<'a>(
+    state: &'a mut HostState,
+    handle: &Resource<ProcHandle>,
+) -> Result<&'a mut ProcessResource, CapabilityError> {
+    state.resources.get_mut(handle).map_err(table_error)
+}
+
+fn delete_process(
+    state: &mut HostState,
+    handle: Resource<ProcHandle>,
+) -> Result<(), CapabilityError> {
+    let _ = state.resources.delete(handle).map_err(table_error)?;
+    Ok(())
+}
+
 fn metadata_to_entry(
     entry_name: String,
     meta: fs::Metadata,
@@ -201,6 +219,43 @@ fn write_file_bytes(
         .write(data)
         .map(|written| written as u64)
         .map_err(|err| io_error(op, err))
+}
+
+fn ensure_command_allowed(config: &HostConfig, program: &str) -> Result<(), CapabilityError> {
+    if config.is_proc_allowed(program) {
+        Ok(())
+    } else {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            format!("command `{program}` is not allowed"),
+        ))
+    }
+}
+
+fn to_exit_status(resource: &ProcessResource) -> bindings::osagent::proc::proc::ExitStatus {
+    bindings::osagent::proc::proc::ExitStatus {
+        code: resource.exit_code,
+        signal: None,
+        timed_out: resource.timed_out,
+    }
+}
+
+fn read_process_stream(
+    data: &[u8],
+    offset: &mut usize,
+    max_bytes: u32,
+) -> bindings::osagent::proc::proc::StreamRead {
+    let max = max_bytes as usize;
+    let remaining = data.len().saturating_sub(*offset);
+    let take = remaining.min(max);
+    let start = *offset;
+    let end = start + take;
+    let chunk = data[start..end].to_vec();
+    *offset = end;
+    bindings::osagent::proc::proc::StreamRead {
+        data: chunk,
+        eof: *offset >= data.len(),
+    }
 }
 
 impl bindings::osagent::common::types::Host for HostState {}
@@ -448,20 +503,91 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
 impl bindings::osagent::proc::proc::Host for HostState {
     fn spawn(
         &mut self,
-        _command: wasmtime::component::__internal::String,
-        _options: bindings::osagent::proc::proc::SpawnOptions,
-    ) -> Result<Resource<bindings::osagent::proc::proc::Process>, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "process capability is not implemented",
-        ))
+        command: wasmtime::component::__internal::String,
+        options: bindings::osagent::proc::proc::SpawnOptions,
+    ) -> Result<Resource<ProcHandle>, CapabilityError> {
+        ensure_command_allowed(&self.config, &command)?;
+
+        if options.timeout_ms.is_some() {
+            return Err(capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                "timeout is not supported yet",
+            ));
+        }
+
+        if !matches!(
+            options.stdin,
+            bindings::osagent::proc::proc::StdioMode::Null
+        ) {
+            return Err(capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                "stdin must be null for now",
+            ));
+        }
+        if !matches!(
+            options.stdout,
+            bindings::osagent::proc::proc::StdioMode::Pipe
+        ) || !matches!(
+            options.stderr,
+            bindings::osagent::proc::proc::StdioMode::Pipe
+        ) {
+            return Err(capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                "stdout/stderr must be pipe",
+            ));
+        }
+
+        let mut cmd = Command::new(&command);
+        for arg in options.argv {
+            cmd.arg(arg);
+        }
+
+        let working_dir = if let Some(dir) = options.working_dir {
+            let resolved = resolve_child(&self.config.workspace_root, &dir)?;
+            ensure_within_workspace(&self.config.workspace_root, &resolved)?;
+            Some(resolved)
+        } else {
+            None
+        };
+        if let Some(dir) = working_dir.as_ref() {
+            cmd.current_dir(dir.as_std_path());
+        } else {
+            cmd.current_dir(self.config.workspace_root.as_std_path());
+        }
+
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.env_clear();
+        for env in options.env {
+            cmd.env(env.key, env.value);
+        }
+
+        let output = cmd.output().map_err(|err| io_error("proc.spawn", err))?;
+        let resource = ProcessResource {
+            command: command.clone(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            stdout_pos: 0,
+            stderr_pos: 0,
+            exit_code: output.status.code(),
+            timed_out: false,
+        };
+        insert_process(self, resource)
     }
+}
+
+fn insert_process(
+    state: &mut HostState,
+    proc: ProcessResource,
+) -> Result<Resource<ProcHandle>, CapabilityError> {
+    state.resources.push(proc).map_err(table_error)
 }
 
 impl bindings::osagent::proc::proc::HostProcess for HostState {
     fn write_stdin(
         &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _: Resource<ProcHandle>,
         _chunk: wasmtime::component::__internal::Vec<u8>,
         _eof: bool,
     ) -> Result<u32, CapabilityError> {
@@ -473,54 +599,56 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
 
     fn read_stdout(
         &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
-        _max_bytes: u32,
+        handle: Resource<ProcHandle>,
+        max_bytes: u32,
     ) -> Result<bindings::osagent::proc::proc::StreamRead, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "process capability is not implemented",
+        let process = process_entry_mut(self, &handle)?;
+        Ok(read_process_stream(
+            &process.stdout,
+            &mut process.stdout_pos,
+            max_bytes,
         ))
     }
 
     fn read_stderr(
         &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
-        _max_bytes: u32,
+        handle: Resource<ProcHandle>,
+        max_bytes: u32,
     ) -> Result<bindings::osagent::proc::proc::StreamRead, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "process capability is not implemented",
+        let process = process_entry_mut(self, &handle)?;
+        Ok(read_process_stream(
+            &process.stderr,
+            &mut process.stderr_pos,
+            max_bytes,
         ))
     }
 
     fn wait(
         &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        handle: Resource<ProcHandle>,
         _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
     ) -> Result<bindings::osagent::proc::proc::ExitStatus, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "process capability is not implemented",
-        ))
+        let process = process_entry_mut(self, &handle)?;
+        Ok(to_exit_status(process))
     }
 
     fn signal(
         &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _rep: Resource<ProcHandle>,
         _kind: bindings::osagent::proc::proc::ProcessSignal,
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "process capability is not implemented",
+            "signaling processes is not supported",
         ))
     }
 
-    fn close(&mut self, _rep: Resource<bindings::osagent::proc::proc::Process>) -> () {}
+    fn close(&mut self, handle: Resource<ProcHandle>) -> () {
+        let _ = delete_process(self, handle);
+    }
 
-    fn drop(
-        &mut self,
-        _rep: Resource<bindings::osagent::proc::proc::Process>,
-    ) -> wasmtime::Result<()> {
+    fn drop(&mut self, handle: Resource<ProcHandle>) -> wasmtime::Result<()> {
+        let _ = delete_process(self, handle);
         Ok(())
     }
 }

@@ -6,6 +6,7 @@ mod bindings {
         with: {
             "osagent:fs/fs/dir-handle": crate::resources::DirHandleResource,
             "osagent:fs/fs/file-handle": crate::resources::FileHandleResource,
+            "osagent:proc/proc/process": crate::resources::ProcessResource,
         },
     });
 }

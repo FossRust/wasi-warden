@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 /// Command line interface for the host daemon.
 #[derive(Parser, Debug)]
@@ -37,4 +37,8 @@ pub struct StepArgs {
     /// Step index for logging/budgeting.
     #[arg(long, default_value_t = 0)]
     pub step: u32,
+
+    /// Commands the proc capability may execute (repeat flag to allow multiple).
+    #[arg(long = "allow-proc", value_name = "CMD", action = ArgAction::Append)]
+    pub allow_proc: Vec<String>,
 }

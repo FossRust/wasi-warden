@@ -10,13 +10,30 @@ use crate::cli::StepArgs;
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub workspace_root: Utf8PathBuf,
+    pub allowed_proc_commands: Vec<String>,
 }
 
 impl HostConfig {
     pub fn from_step_args(args: &StepArgs) -> Result<Self> {
         let workspace_root = normalize_path(&args.workspace)
             .with_context(|| format!("invalid workspace path {}", args.workspace.display()))?;
-        Ok(Self { workspace_root })
+        Ok(Self {
+            workspace_root,
+            allowed_proc_commands: args.allow_proc.clone(),
+        })
+    }
+
+    pub fn is_proc_allowed(&self, program: &str) -> bool {
+        if self.allowed_proc_commands.is_empty() {
+            return false;
+        }
+        let base = Path::new(program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(program);
+        self.allowed_proc_commands
+            .iter()
+            .any(|entry| entry == program || entry == base)
     }
 }
 
