@@ -1,8 +1,9 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
+use serde::Deserialize;
 
 use crate::cli::StepArgs;
 
@@ -15,11 +16,25 @@ pub struct HostConfig {
 
 impl HostConfig {
     pub fn from_step_args(args: &StepArgs) -> Result<Self> {
-        let workspace_root = normalize_path(&args.workspace)
-            .with_context(|| format!("invalid workspace path {}", args.workspace.display()))?;
+        let file_cfg = FileConfig::load(&args.config)?;
+        let workspace_path = args
+            .workspace
+            .clone()
+            .or_else(|| file_cfg.workspace_root.clone().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let workspace_root = normalize_path(&workspace_path).with_context(|| {
+            format!(
+                "invalid workspace path {}",
+                workspace_path.to_string_lossy()
+            )
+        })?;
+        let mut allowed_proc_commands = file_cfg.allow_proc.unwrap_or_default();
+        allowed_proc_commands.extend(args.allow_proc.iter().cloned());
+        allowed_proc_commands.sort();
+        allowed_proc_commands.dedup();
         Ok(Self {
             workspace_root,
-            allowed_proc_commands: args.allow_proc.clone(),
+            allowed_proc_commands,
         })
     }
 
@@ -34,6 +49,25 @@ impl HostConfig {
         self.allowed_proc_commands
             .iter()
             .any(|entry| entry == program || entry == base)
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct FileConfig {
+    workspace_root: Option<String>,
+    allow_proc: Option<Vec<String>>,
+}
+
+impl FileConfig {
+    fn load(path: &Path) -> Result<Self> {
+        if path.exists() {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
+            toml::from_str(&raw)
+                .with_context(|| format!("failed to parse config {}", path.display()))
+        } else {
+            Ok(Self::default())
+        }
     }
 }
 

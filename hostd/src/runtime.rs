@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::{info, warn};
 use wasmtime::{
-    component::{Component, Linker},
     Config, Engine, Store,
+    component::{Component, Linker},
 };
 use wasmtime_wasi::add_to_linker_sync;
 

@@ -19,12 +19,16 @@ pub enum Commands {
 #[derive(clap::Args, Debug)]
 pub struct StepArgs {
     /// Path to the compiled agent-core component (.wasm/.cwasm).
-    #[arg(long, default_value = "./target/wasm32-wasip2/release/agent_core.wasm")]
+    #[arg(long, default_value = "./target/wasm32-wasip2/release/agent-core.wasm")]
     pub component: PathBuf,
 
-    /// Root directory the agent may access via the fs capability.
-    #[arg(long, default_value = ".")]
-    pub workspace: PathBuf,
+    /// Path to a host configuration file (TOML). Defaults to ./hostd.toml.
+    #[arg(long, default_value = "hostd.toml")]
+    pub config: PathBuf,
+
+    /// Root directory the agent may access via the fs capability (overrides config).
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
 
     /// Human task description supplied to the planner.
     #[arg(long)]
@@ -38,7 +42,7 @@ pub struct StepArgs {
     #[arg(long, default_value_t = 0)]
     pub step: u32,
 
-    /// Commands the proc capability may execute (repeat flag to allow multiple).
+    /// Commands the proc capability may execute (repeat flag to allow multiple, overrides config).
     #[arg(long = "allow-proc", value_name = "CMD", action = ArgAction::Append)]
     pub allow_proc: Vec<String>,
 }

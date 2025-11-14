@@ -9,9 +9,7 @@ mod bindings {
     });
 }
 
-use bindings::exports::osagent::agent::planner::{
-    self, AgentError, CompletePlan, StepResponse,
-};
+use bindings::exports::osagent::agent::planner::{self, AgentError, CompletePlan, StepResponse};
 use bindings::osagent::common::types::{CapabilityError, CapabilityErrorCode};
 use bindings::osagent::fs::fs;
 use bindings::osagent::proc::proc;
@@ -19,10 +17,7 @@ use bindings::osagent::proc::proc;
 struct Agent;
 
 impl planner::Guest for Agent {
-    fn step(
-        task: String,
-        _observation: planner::Observation,
-    ) -> Result<StepResponse, AgentError> {
+    fn step(task: String, _observation: planner::Observation) -> Result<StepResponse, AgentError> {
         if let Some(path) = task.strip_prefix("list ") {
             let summary = format!("listed path `{}`", path.trim());
             let output = list_path(path.trim()).map_err(agent_error)?;
