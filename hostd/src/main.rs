@@ -1,3 +1,4 @@
+mod actions;
 mod resources;
 mod bindings {
     wasmtime::component::bindgen!({
