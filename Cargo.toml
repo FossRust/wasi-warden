@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "hostd",
+    "tools/wit-check",
+]
+resolver = "2"

@@ -1,0 +1,814 @@
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path};
+use std::time::UNIX_EPOCH;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use wasmtime::component::{Resource, ResourceTableError};
+
+use crate::bindings;
+use crate::resources::{DirHandleResource, FileHandleResource};
+use crate::state::HostState;
+
+type CapabilityError = bindings::osagent::common::types::CapabilityError;
+type CapabilityErrorCode = bindings::osagent::common::types::CapabilityErrorCode;
+type DirHandle = bindings::osagent::fs::fs::DirHandle;
+type FileHandle = bindings::osagent::fs::fs::FileHandle;
+
+fn capability_error(code: CapabilityErrorCode, message: impl Into<String>) -> CapabilityError {
+    CapabilityError {
+        code,
+        message: message.into(),
+        detail: None,
+    }
+}
+
+fn table_error(err: ResourceTableError) -> CapabilityError {
+    match err {
+        ResourceTableError::NotPresent | ResourceTableError::WrongType => {
+            capability_error(CapabilityErrorCode::InvalidArgument, "invalid handle")
+        }
+        ResourceTableError::Full => capability_error(
+            CapabilityErrorCode::Limit,
+            "too many open capability handles",
+        ),
+        ResourceTableError::HasChildren => {
+            capability_error(CapabilityErrorCode::Conflict, "resource has live children")
+        }
+    }
+}
+
+fn io_error(op: &str, err: std::io::Error) -> CapabilityError {
+    let code = match err.kind() {
+        std::io::ErrorKind::NotFound => CapabilityErrorCode::NotFound,
+        std::io::ErrorKind::PermissionDenied => CapabilityErrorCode::Denied,
+        _ => CapabilityErrorCode::Internal,
+    };
+    capability_error(code, format!("{op} failed: {err}"))
+}
+
+fn resolve_child(parent: &Utf8Path, relative: &str) -> Result<Utf8PathBuf, CapabilityError> {
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute() {
+        return Err(capability_error(
+            CapabilityErrorCode::InvalidArgument,
+            "absolute paths are not allowed",
+        ));
+    }
+
+    let mut result = parent.as_std_path().to_path_buf();
+    for component in rel_path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(capability_error(
+                    CapabilityErrorCode::InvalidArgument,
+                    "absolute paths are not allowed",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(capability_error(
+                    CapabilityErrorCode::InvalidArgument,
+                    "parent segments are not allowed",
+                ));
+            }
+            Component::Normal(seg) => result.push(seg),
+        }
+    }
+
+    Utf8PathBuf::from_path_buf(result)
+        .map_err(|_| capability_error(CapabilityErrorCode::InvalidArgument, "path is not UTF-8"))
+}
+
+fn dir_path<'a>(
+    state: &'a HostState,
+    handle: &Resource<DirHandle>,
+) -> Result<&'a Utf8Path, CapabilityError> {
+    state
+        .resources
+        .get(handle)
+        .map(|dir: &DirHandleResource| dir.path.as_ref())
+        .map_err(table_error)
+}
+
+fn dir_path_buf(
+    state: &HostState,
+    handle: &Resource<DirHandle>,
+) -> Result<Utf8PathBuf, CapabilityError> {
+    dir_path(state, handle).map(|p| p.to_path_buf())
+}
+
+fn insert_dir(
+    state: &mut HostState,
+    path: Utf8PathBuf,
+) -> Result<Resource<DirHandle>, CapabilityError> {
+    state
+        .resources
+        .push(DirHandleResource { path })
+        .map_err(table_error)
+}
+
+fn insert_file(
+    state: &mut HostState,
+    entry: FileHandleResource,
+) -> Result<Resource<FileHandle>, CapabilityError> {
+    state.resources.push(entry).map_err(table_error)
+}
+
+fn file_entry_mut<'a>(
+    state: &'a mut HostState,
+    handle: &Resource<FileHandle>,
+) -> Result<&'a mut FileHandleResource, CapabilityError> {
+    state.resources.get_mut(handle).map_err(table_error)
+}
+
+fn delete_dir(state: &mut HostState, handle: Resource<DirHandle>) -> Result<(), CapabilityError> {
+    let _ = state.resources.delete(handle).map_err(table_error)?;
+    Ok(())
+}
+
+fn delete_file(state: &mut HostState, handle: Resource<FileHandle>) -> Result<(), CapabilityError> {
+    let _ = state.resources.delete(handle).map_err(table_error)?;
+    Ok(())
+}
+
+fn metadata_to_entry(
+    entry_name: String,
+    meta: fs::Metadata,
+) -> bindings::osagent::fs::fs::DirEntry {
+    bindings::osagent::fs::fs::DirEntry {
+        name: entry_name,
+        kind: entry_kind(&meta),
+        size_bytes: Some(meta.len()),
+        modified_ms: file_time_ms(&meta),
+    }
+}
+
+fn entry_kind(meta: &fs::Metadata) -> bindings::osagent::fs::fs::EntryKind {
+    if meta.is_file() {
+        bindings::osagent::fs::fs::EntryKind::File
+    } else if meta.is_dir() {
+        bindings::osagent::fs::fs::EntryKind::Directory
+    } else if meta.file_type().is_symlink() {
+        bindings::osagent::fs::fs::EntryKind::Symlink
+    } else {
+        bindings::osagent::fs::fs::EntryKind::Other
+    }
+}
+
+fn file_time_ms(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .map(|dur| dur.as_millis() as u64)
+}
+
+fn ensure_within_workspace(root: &Utf8Path, candidate: &Utf8Path) -> Result<(), CapabilityError> {
+    if candidate.as_str().starts_with(root.as_str()) {
+        Ok(())
+    } else {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "path escapes workspace root",
+        ))
+    }
+}
+
+fn read_file_bytes(
+    state: &mut HostState,
+    handle: &Resource<FileHandle>,
+    max_bytes: u64,
+    op: &str,
+) -> Result<Vec<u8>, CapabilityError> {
+    let entry = file_entry_mut(state, handle)?;
+    let mut reader = (&mut entry.file).take(max_bytes);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|err| io_error(op, err))?;
+    Ok(buf)
+}
+
+fn write_file_bytes(
+    state: &mut HostState,
+    handle: &Resource<FileHandle>,
+    data: &[u8],
+    op: &str,
+) -> Result<u64, CapabilityError> {
+    let entry = file_entry_mut(state, handle)?;
+    entry
+        .file
+        .write(data)
+        .map(|written| written as u64)
+        .map_err(|err| io_error(op, err))
+}
+
+impl bindings::osagent::common::types::Host for HostState {}
+
+impl bindings::osagent::fs::fs::Host for HostState {
+    fn open_workspace(&mut self) -> Result<Resource<DirHandle>, CapabilityError> {
+        insert_dir(self, self.config.workspace_root.clone())
+    }
+
+    fn open_dir(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: wasmtime::component::__internal::String,
+    ) -> Result<Resource<DirHandle>, CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let candidate = resolve_child(&parent_path, &relative_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &candidate)?;
+        let metadata =
+            fs::metadata(candidate.as_std_path()).map_err(|err| io_error("fs.open-dir", err))?;
+        if !metadata.is_dir() {
+            return Err(capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                "path is not a directory",
+            ));
+        }
+        insert_dir(self, candidate)
+    }
+
+    fn ensure_dir(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: wasmtime::component::__internal::String,
+    ) -> Result<Resource<DirHandle>, CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let candidate = resolve_child(&parent_path, &relative_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &candidate)?;
+        fs::create_dir_all(candidate.as_std_path())
+            .map_err(|err| io_error("fs.ensure-dir", err))?;
+        insert_dir(self, candidate)
+    }
+
+    fn remove_dir(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: wasmtime::component::__internal::String,
+        recursive: bool,
+    ) -> Result<(), CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let target = resolve_child(&parent_path, &relative_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &target)?;
+        if recursive {
+            fs::remove_dir_all(target.as_std_path()).map_err(|err| io_error("fs.remove-dir", err))
+        } else {
+            fs::remove_dir(target.as_std_path()).map_err(|err| io_error("fs.remove-dir", err))
+        }
+    }
+
+    fn remove_file(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: wasmtime::component::__internal::String,
+    ) -> Result<(), CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let target = resolve_child(&parent_path, &relative_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &target)?;
+        fs::remove_file(target.as_std_path()).map_err(|err| io_error("fs.remove-file", err))
+    }
+
+    fn rename(
+        &mut self,
+        parent: Resource<DirHandle>,
+        old_path: wasmtime::component::__internal::String,
+        new_path: wasmtime::component::__internal::String,
+    ) -> Result<(), CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let from = resolve_child(&parent_path, &old_path)?;
+        let to = resolve_child(&parent_path, &new_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &from)?;
+        ensure_within_workspace(&self.config.workspace_root, &to)?;
+        fs::rename(from.as_std_path(), to.as_std_path()).map_err(|err| io_error("fs.rename", err))
+    }
+
+    fn list_dir(
+        &mut self,
+        target: Resource<DirHandle>,
+    ) -> Result<
+        wasmtime::component::__internal::Vec<bindings::osagent::fs::fs::DirEntry>,
+        CapabilityError,
+    > {
+        let dir_path = dir_path(self, &target)?.to_path_buf();
+        let mut entries = Vec::new();
+        let read = fs::read_dir(&dir_path).map_err(|err| io_error("fs.list-dir", err))?;
+        for entry in read {
+            let entry = entry.map_err(|err| io_error("fs.list-dir", err))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+            let metadata = entry
+                .metadata()
+                .map_err(|err| io_error("fs.list-dir", err))?;
+            entries.push(metadata_to_entry(name, metadata));
+        }
+        Ok(entries)
+    }
+
+    fn metadata(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: Option<wasmtime::component::__internal::String>,
+    ) -> Result<bindings::osagent::fs::fs::EntryMetadata, CapabilityError> {
+        let base = dir_path(self, &parent)?.to_path_buf();
+        let path = if let Some(rel) = relative_path {
+            let joined = resolve_child(&base, &rel)?;
+            ensure_within_workspace(&self.config.workspace_root, &joined)?;
+            joined
+        } else {
+            base
+        };
+        let metadata =
+            fs::metadata(path.as_std_path()).map_err(|err| io_error("fs.metadata", err))?;
+        Ok(bindings::osagent::fs::fs::EntryMetadata {
+            name: path
+                .file_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| String::from(".")),
+            kind: entry_kind(&metadata),
+            size_bytes: Some(metadata.len()),
+            modified_ms: file_time_ms(&metadata),
+            readonly: metadata.permissions().readonly(),
+        })
+    }
+
+    fn open_file(
+        &mut self,
+        parent: Resource<DirHandle>,
+        relative_path: wasmtime::component::__internal::String,
+        options: bindings::osagent::fs::fs::FileOpenOptions,
+    ) -> Result<Resource<FileHandle>, CapabilityError> {
+        let parent_path = dir_path_buf(self, &parent)?;
+        let file_path = resolve_child(&parent_path, &relative_path)?;
+        ensure_within_workspace(&self.config.workspace_root, &file_path)?;
+        let mut open_opts = OpenOptions::new();
+        open_opts.read(options.read);
+        open_opts.write(options.write || options.append);
+        open_opts.append(options.append);
+        open_opts.create(options.create);
+        open_opts.truncate(options.truncate);
+        let file = open_opts
+            .open(file_path.as_std_path())
+            .map_err(|err| io_error("fs.open-file", err))?;
+        insert_file(
+            self,
+            FileHandleResource {
+                path: file_path,
+                file,
+            },
+        )
+    }
+}
+
+impl bindings::osagent::fs::fs::HostDirHandle for HostState {
+    fn close(&mut self, handle: Resource<DirHandle>) -> () {
+        let _ = delete_dir(self, handle);
+    }
+
+    fn drop(&mut self, handle: Resource<DirHandle>) -> wasmtime::Result<()> {
+        let _ = delete_dir(self, handle);
+        Ok(())
+    }
+}
+
+impl bindings::osagent::fs::fs::HostFileHandle for HostState {
+    fn read(
+        &mut self,
+        handle: Resource<FileHandle>,
+        max_bytes: u64,
+    ) -> Result<wasmtime::component::__internal::Vec<u8>, CapabilityError> {
+        read_file_bytes(self, &handle, max_bytes, "fs.file.read")
+    }
+
+    fn read_to_string(
+        &mut self,
+        handle: Resource<FileHandle>,
+        max_bytes: u64,
+    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+        let bytes = read_file_bytes(self, &handle, max_bytes, "fs.file.read-to-string")?;
+        String::from_utf8(bytes).map_err(|_| {
+            capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                "file is not valid UTF-8",
+            )
+        })
+    }
+
+    fn write(
+        &mut self,
+        handle: Resource<FileHandle>,
+        bytes: wasmtime::component::__internal::Vec<u8>,
+    ) -> Result<u64, CapabilityError> {
+        write_file_bytes(self, &handle, &bytes, "fs.file.write")
+    }
+
+    fn write_string(
+        &mut self,
+        handle: Resource<FileHandle>,
+        contents: wasmtime::component::__internal::String,
+        newline: bool,
+    ) -> Result<u64, CapabilityError> {
+        let mut data = contents.into_bytes();
+        if newline {
+            data.push(b'\n');
+        }
+        write_file_bytes(self, &handle, &data, "fs.file.write-string")
+    }
+
+    fn set_len(
+        &mut self,
+        handle: Resource<FileHandle>,
+        new_len: u64,
+    ) -> Result<(), CapabilityError> {
+        let file = file_entry_mut(self, &handle)?;
+        file.file
+            .set_len(new_len)
+            .map_err(|err| io_error("fs.file.set-len", err))
+    }
+
+    fn flush(&mut self, handle: Resource<FileHandle>) -> Result<(), CapabilityError> {
+        let file = file_entry_mut(self, &handle)?;
+        file.file
+            .flush()
+            .map_err(|err| io_error("fs.file.flush", err))
+    }
+
+    fn close(&mut self, handle: Resource<FileHandle>) -> () {
+        let _ = delete_file(self, handle);
+    }
+
+    fn drop(&mut self, handle: Resource<FileHandle>) -> wasmtime::Result<()> {
+        let _ = delete_file(self, handle);
+        Ok(())
+    }
+}
+
+impl bindings::osagent::proc::proc::Host for HostState {
+    fn spawn(
+        &mut self,
+        _command: wasmtime::component::__internal::String,
+        _options: bindings::osagent::proc::proc::SpawnOptions,
+    ) -> Result<Resource<bindings::osagent::proc::proc::Process>, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+}
+
+impl bindings::osagent::proc::proc::HostProcess for HostState {
+    fn write_stdin(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _chunk: wasmtime::component::__internal::Vec<u8>,
+        _eof: bool,
+    ) -> Result<u32, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+
+    fn read_stdout(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _max_bytes: u32,
+    ) -> Result<bindings::osagent::proc::proc::StreamRead, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+
+    fn read_stderr(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _max_bytes: u32,
+    ) -> Result<bindings::osagent::proc::proc::StreamRead, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+
+    fn wait(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
+    ) -> Result<bindings::osagent::proc::proc::ExitStatus, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+
+    fn signal(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+        _kind: bindings::osagent::proc::proc::ProcessSignal,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "process capability is not implemented",
+        ))
+    }
+
+    fn close(&mut self, _rep: Resource<bindings::osagent::proc::proc::Process>) -> () {}
+
+    fn drop(
+        &mut self,
+        _rep: Resource<bindings::osagent::proc::proc::Process>,
+    ) -> wasmtime::Result<()> {
+        Ok(())
+    }
+}
+
+impl bindings::osagent::browser::browser::Host for HostState {
+    fn open_session(
+        &mut self,
+        _options: bindings::osagent::browser::browser::SessionOptions,
+    ) -> Result<Resource<bindings::osagent::browser::browser::Session>, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+}
+
+impl bindings::osagent::browser::browser::HostSession for HostState {
+    fn close(&mut self, _rep: Resource<bindings::osagent::browser::browser::Session>) -> () {}
+
+    fn drop(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+    ) -> wasmtime::Result<()> {
+        Ok(())
+    }
+
+    fn goto(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _url: wasmtime::component::__internal::String,
+        _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
+    ) -> Result<bindings::osagent::browser::browser::PageState, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn describe_page(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _include_html: bool,
+    ) -> Result<bindings::osagent::browser::browser::PageState, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn screenshot(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _kind: bindings::osagent::browser::browser::ScreenshotKind,
+    ) -> Result<bindings::osagent::browser::browser::Screenshot, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn eval(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _expression: wasmtime::component::__internal::String,
+    ) -> Result<bindings::osagent::common::types::Json, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn find(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _selector: bindings::osagent::browser::browser::Selector,
+        _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
+    ) -> Result<Resource<bindings::osagent::browser::browser::ElementHandle>, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn query_all(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _selector: bindings::osagent::browser::browser::Selector,
+    ) -> Result<
+        wasmtime::component::__internal::Vec<
+            Resource<bindings::osagent::browser::browser::ElementHandle>,
+        >,
+        CapabilityError,
+    > {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+}
+
+impl bindings::osagent::browser::browser::HostElementHandle for HostState {
+    fn click(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn type_text(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+        _text: wasmtime::component::__internal::String,
+        _submit: bool,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn clear(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn attribute(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+        _name: wasmtime::component::__internal::String,
+    ) -> Result<Option<wasmtime::component::__internal::String>, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn inner_text(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn html(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "browser capability is not implemented",
+        ))
+    }
+
+    fn drop(
+        &mut self,
+        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
+    ) -> wasmtime::Result<()> {
+        Ok(())
+    }
+}
+
+impl bindings::osagent::input::input::Host for HostState {
+    fn key_sequence(
+        &mut self,
+        _text: wasmtime::component::__internal::String,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "input capability is not implemented",
+        ))
+    }
+
+    fn send_key_chord(
+        &mut self,
+        _chord: bindings::osagent::input::input::KeyChord,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "input capability is not implemented",
+        ))
+    }
+
+    fn mouse_move(
+        &mut self,
+        _motion: bindings::osagent::input::input::PointerMove,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "input capability is not implemented",
+        ))
+    }
+
+    fn mouse_click(
+        &mut self,
+        _button: bindings::osagent::input::input::MouseButton,
+        _hold_ms: Option<bindings::osagent::common::types::Milliseconds>,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "input capability is not implemented",
+        ))
+    }
+
+    fn mouse_scroll(
+        &mut self,
+        _delta: bindings::osagent::input::input::ScrollDelta,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "input capability is not implemented",
+        ))
+    }
+}
+
+impl bindings::osagent::llm::llm::Host for HostState {
+    fn complete(
+        &mut self,
+        _messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+        _options: bindings::osagent::llm::llm::Options,
+    ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "llm capability is not implemented",
+        ))
+    }
+
+    fn call_tools(
+        &mut self,
+        _messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+        _tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
+        _options: bindings::osagent::llm::llm::Options,
+    ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "llm capability is not implemented",
+        ))
+    }
+}
+
+impl bindings::osagent::policy::policy::Host for HostState {
+    fn describe(
+        &mut self,
+    ) -> Result<bindings::osagent::policy::policy::PolicySnapshot, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "policy capability is not implemented",
+        ))
+    }
+
+    fn claim_budget(
+        &mut self,
+        _kind: bindings::osagent::policy::policy::BudgetKind,
+        _units: u64,
+    ) -> Result<bindings::osagent::policy::policy::BudgetSnapshot, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "policy capability is not implemented",
+        ))
+    }
+
+    fn request_capability(
+        &mut self,
+        _request: bindings::osagent::policy::policy::GrantRequest,
+    ) -> Result<bindings::osagent::policy::policy::GrantResponse, CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "policy capability is not implemented",
+        ))
+    }
+
+    fn log_event(
+        &mut self,
+        _event: bindings::osagent::common::types::AuditEvent,
+    ) -> Result<(), CapabilityError> {
+        Err(capability_error(
+            CapabilityErrorCode::Denied,
+            "policy capability is not implemented",
+        ))
+    }
+}

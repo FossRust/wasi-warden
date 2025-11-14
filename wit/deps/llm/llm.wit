@@ -24,11 +24,11 @@ interface llm {
 
   record options {
     max-tokens: option<u32>,
-    temperature: option<float32>,
-    top-p: option<float32>,
+    temperature: option<f32>,
+    top-p: option<f32>,
     stop: list<string>,
-    presence-penalty: option<float32>,
-    frequency-penalty: option<float32>
+    presence-penalty: option<f32>,
+    frequency-penalty: option<f32>
   }
 
   record token-usage {

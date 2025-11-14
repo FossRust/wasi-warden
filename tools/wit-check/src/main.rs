@@ -36,10 +36,18 @@ fn dump_world(resolve: &Resolve, world_id: WorldId, alias: &str) {
     let world = &resolve.worlds[world_id];
     println!("  world {} (alias {alias})", world.name);
     for (name, item) in &world.imports {
-        println!("    import {} -> {}", key_to_string(name), describe_item(item));
+        println!(
+            "    import {} -> {}",
+            key_to_string(name),
+            describe_item(item)
+        );
     }
     for (name, item) in &world.exports {
-        println!("    export {} -> {}", key_to_string(name), describe_item(item));
+        println!(
+            "    export {} -> {}",
+            key_to_string(name),
+            describe_item(item)
+        );
     }
 }
 
