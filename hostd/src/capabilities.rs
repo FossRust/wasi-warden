@@ -5,10 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ureq::Agent;
 use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
@@ -55,16 +54,10 @@ fn require_llm_settings<'a>(config: &'a HostConfig) -> Result<&'a LlmSettings, C
     })
 }
 
-fn http_client() -> Result<Client, CapabilityError> {
-    Client::builder()
+fn http_agent() -> Agent {
+    ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(60))
         .build()
-        .map_err(|err| {
-            capability_error(
-                CapabilityErrorCode::Unavailable,
-                format!("http error: {err}"),
-            )
-        })
 }
 
 fn chat_endpoint(base: &str) -> String {
@@ -235,40 +228,34 @@ fn execute_chat_request(
     settings: &LlmSettings,
     body: &ChatRequest,
 ) -> Result<ChatResponse, CapabilityError> {
-    let client = http_client()?;
     let url = chat_endpoint(&settings.api_base);
+    let agent = http_agent();
     let token = format!("Bearer {}", settings.api_key);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&token).map_err(|err| {
-            capability_error(
-                CapabilityErrorCode::InvalidArgument,
-                format!("invalid api key: {err}"),
-            )
-        })?,
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let response = client
-        .post(url)
-        .headers(headers)
-        .json(body)
-        .send()
-        .map_err(|err| {
+    let payload = serde_json::to_value(body).map_err(|err| {
+        capability_error(
+            CapabilityErrorCode::Internal,
+            format!("failed to encode llm request: {err}"),
+        )
+    })?;
+    let response = agent
+        .post(&url)
+        .set("Authorization", &token)
+        .set("Content-Type", "application/json")
+        .send_json(payload);
+    let response = response.map_err(|err| match err {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
             capability_error(
                 CapabilityErrorCode::Unavailable,
-                format!("llm request failed: {err}"),
+                format!("llm error {code}: {body}"),
             )
-        })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().unwrap_or_default();
-        return Err(capability_error(
+        }
+        ureq::Error::Transport(tr) => capability_error(
             CapabilityErrorCode::Unavailable,
-            format!("llm error {status}: {text}"),
-        ));
-    }
-    response.json().map_err(|err| {
+            format!("llm transport error: {tr}"),
+        ),
+    })?;
+    response.into_json().map_err(|err| {
         capability_error(
             CapabilityErrorCode::Internal,
             format!("failed to parse llm response: {err}"),

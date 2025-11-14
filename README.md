@@ -179,6 +179,13 @@ cd ../agent-core
 cargo component build --release
 ```
 
+Copy the sample configuration and edit it with your workspace, process allowlist, and API keys:
+
+```bash
+cp ../hostd-sample.toml ../hostd.toml
+# edit hostd.toml
+```
+
 Run a test step (placeholder, subject to change):
 
 ```bash
